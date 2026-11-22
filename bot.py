@@ -1,9 +1,19 @@
 import json
 import os
+import subprocess
 import sys
 import time
 
 import requests
+
+# La bibliothèque vinted-scraper est installée automatiquement si besoin.
+try:
+    from vinted_scraper import VintedScraper
+except ImportError:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--quiet", "vinted-scraper"]
+    )
+    from vinted_scraper import VintedScraper
 
 # Le lien du webhook Discord est lu depuis un secret, jamais écrit ici.
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
@@ -59,52 +69,57 @@ SERIES = [
 ]
 
 
-def make_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "fr-FR,fr;q=0.9",
-    })
-    # Une première visite pour récupérer les cookies de session
-    s.get(DOMAIN, timeout=20)
-    return s
+def g(obj, name, default=None):
+    """Lit un champ, que l'objet soit un dictionnaire ou un objet."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
 
-def search(session, query):
-    r = session.get(
-        f"{DOMAIN}/api/v2/catalog/items",
-        params={"search_text": query, "order": "newest_first", "per_page": 30},
-        timeout=20,
+def search(scraper, query):
+    items = scraper.search(
+        {"search_text": query, "order": "newest_first", "per_page": 30}
     )
-    r.raise_for_status()
-    return r.json().get("items", [])
+    return list(items or [])
 
 
 def price_of(item):
-    p = item.get("price")
-    if isinstance(p, dict):
-        return f"{p.get('amount', '?')} {p.get('currency_code', '€')}"
-    return f"{p} €" if p is not None else "?"
+    p = g(item, "price")
+    if p is None:
+        return "?"
+    if isinstance(p, (str, int, float)):
+        return f"{p} €"
+    amount = g(p, "amount", "?")
+    cur = g(p, "currency_code", "€")
+    return f"{amount} {cur}"
+
+
+def item_url(item):
+    url = g(item, "url") or ""
+    if url.startswith("/"):
+        url = DOMAIN + url
+    return url or f"{DOMAIN}/items/{g(item, 'id')}"
 
 
 def send_discord(query, item):
-    photo = (item.get("photo") or {}).get("url")
+    photo = g(item, "photo")
+    photo_url = g(photo, "url") or g(photo, "full_size_url")
     embed = {
-        "title": item.get("title", "Annonce"),
-        "url": item.get("url") or f"{DOMAIN}/items/{item['id']}",
+        "title": g(item, "title", "Annonce"),
+        "url": item_url(item),
         "description": f"Recherche : **{query}**\nPrix : **{price_of(item)}**",
         "color": 0x09B1BA,
     }
-    if item.get("size_title"):
-        embed["description"] += f"\nTaille/info : {item['size_title']}"
-    if item.get("status"):
-        embed["description"] += f"\nÉtat : {item['status']}"
-    if photo:
-        embed["thumbnail"] = {"url": photo}
+    size = g(item, "size_title")
+    status = g(item, "status")
+    if size:
+        embed["description"] += f"\nTaille/info : {size}"
+    if status:
+        embed["description"] += f"\nÉtat : {status}"
+    if photo_url:
+        embed["thumbnail"] = {"url": photo_url}
 
     for _ in range(3):
         r = requests.post(WEBHOOK, json={"embeds": [embed]}, timeout=20)
@@ -126,13 +141,19 @@ def main():
             seen = json.load(f)
 
     queries = list(dict.fromkeys(q.strip().lower() for q in SERIES))
-    session = make_session()
+
+    try:
+        scraper = VintedScraper(DOMAIN)
+    except Exception as e:
+        print(f"Impossible de se connecter à Vinted : {e}")
+        sys.exit(1)
+
     ok, failed = 0, 0
     notified = set()
 
     for q in queries:
         try:
-            items = search(session, q)
+            items = search(scraper, q)
         except Exception as e:
             print(f"Échec pour '{q}' : {e}")
             failed += 1
@@ -140,14 +161,14 @@ def main():
             continue
         ok += 1
 
-        ids = [str(i["id"]) for i in items]
+        ids = [str(g(i, "id")) for i in items]
         if q not in seen:
             # Première fois pour cette recherche : on mémorise sans notifier
             seen[q] = ids
         else:
             known = set(seen[q])
             for item in reversed(items):
-                iid = str(item["id"])
+                iid = str(g(item, "id"))
                 if iid not in known and iid not in notified:
                     notified.add(iid)
                     send_discord(q, item)
